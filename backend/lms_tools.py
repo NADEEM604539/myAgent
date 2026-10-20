@@ -4,7 +4,7 @@ from pathlib import Path
 from queue import Queue
 import re
 from threading import Event, Lock, Thread
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from langchain_core.tools import tool
 from playwright.sync_api import Error as PlaywrightError
@@ -13,6 +13,41 @@ from playwright.sync_api import sync_playwright
 
 _lms_browser_worker = None
 _lms_browser_worker_lock = Lock()
+
+
+def _desktop_dir() -> Path:
+    override = os.getenv("LMS_DOWNLOAD_DIR")
+    if override:
+        return Path(override)
+    home = Path.home()
+    candidates = []
+    onedrive = os.environ.get("OneDrive")
+    if onedrive:
+        candidates.append(Path(onedrive) / "Desktop")
+    candidates.extend([home / "OneDrive" / "Desktop", home / "Desktop"])
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return Path(r"C:\Users\ndm60\OneDrive\Desktop")
+
+
+def _download_destination(filename: str, activity_name: str) -> Path:
+    filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(" .")
+    if not filename:
+        filename = re.sub(r"[^a-zA-Z0-9_-]+", "_", activity_name).strip("_")
+    if not Path(filename).suffix:
+        filename = f"{filename}.download"
+
+    download_dir = _desktop_dir() / "MyAgent LMS"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    destination = download_dir / filename
+    suffix = destination.suffix
+    stem = destination.stem
+    counter = 1
+    while destination.exists():
+        destination = download_dir / f"{stem} ({counter}){suffix}"
+        counter += 1
+    return destination
 
 
 def _course_match_score(query: str, course_name: str) -> int:
@@ -82,13 +117,15 @@ class _LmsBrowserWorker:
     def select_course(self, course_query: str) -> str:
         return self._request(("select_course", course_query))
 
-    def open_activity(self, operation: str, course_query: str, item_query: str) -> str:
-        return self._request((operation, course_query, item_query))
+    def open_activity(
+        self, operation: str, course_query: str, item_query: str, extra=None
+    ) -> str:
+        return self._request((operation, course_query, item_query, extra))
 
     def _request(self, request) -> str:
         result = Future()
         self._requests.put((request, result))
-        return result.result(timeout=90)
+        return result.result(timeout=300)
 
     def _run(self):
         playwright = None
@@ -134,7 +171,9 @@ class _LmsBrowserWorker:
                         _, person_name, username, password = request
                         page = pages.get(person_name)
                         if page is None or page.is_closed():
-                            page = browser.new_page()
+                            # Use an explicit context so extra tabs (e.g. for
+                            # downloads) can share this login session.
+                            page = browser.new_context().new_page()
                             pages[person_name] = page
 
                         if (
@@ -214,8 +253,12 @@ class _LmsBrowserWorker:
                         "open_quiz",
                         "open_submission",
                         "download_material",
+                        "download_submission",
+                        "delete_submission",
+                        "upload_submission",
+                        "submission_details",
                     }:
-                        _, course_query, item_query = request
+                        _, course_query, item_query, extra = request
                         if active_person is None or active_person not in pages:
                             result.set_result(
                                 "No LMS account is logged in yet. Log in first, then "
@@ -240,7 +283,13 @@ class _LmsBrowserWorker:
                         if operation == "open_quiz":
                             module_path = "/mod/quiz/"
                             item_type = "quiz"
-                        elif operation == "open_submission":
+                        elif operation in {
+                            "open_submission",
+                            "download_submission",
+                            "delete_submission",
+                            "upload_submission",
+                            "submission_details",
+                        }:
                             module_path = "/mod/assign/"
                             item_type = "submission"
                         else:
@@ -262,6 +311,43 @@ class _LmsBrowserWorker:
                             result.set_result(
                                 f'Downloaded "{item["name"]}" from course '
                                 f'"{course["name"]}" to {destination}.'
+                            )
+                            continue
+
+                        if operation == "download_submission":
+                            paths = self._download_submission_files(page, item)
+                            if not paths:
+                                result.set_result(
+                                    f'In course "{course["name"]}": nothing has been '
+                                    f'submitted to "{item["name"]}" yet, so there is '
+                                    "no file to download."
+                                )
+                                continue
+                            result.set_result(
+                                f'Downloaded {len(paths)} submitted file(s) for '
+                                f'"{item["name"]}" in course "{course["name"]}" to: '
+                                + "; ".join(str(path) for path in paths)
+                            )
+                            continue
+
+                        if operation == "delete_submission":
+                            message = self._delete_submission(page, item)
+                            result.set_result(
+                                f'In course "{course["name"]}": {message}'
+                            )
+                            continue
+
+                        if operation == "upload_submission":
+                            message = self._upload_submission(page, item, extra or {})
+                            result.set_result(
+                                f'In course "{course["name"]}": {message}'
+                            )
+                            continue
+
+                        if operation == "submission_details":
+                            message = self._get_submission_details(page, item)
+                            result.set_result(
+                                f'In course "{course["name"]}":\n{message}'
                             )
                             continue
 
@@ -338,7 +424,47 @@ class _LmsBrowserWorker:
         )
 
     def _download_course_file(self, page, activity: dict) -> Path:
-        page.goto(activity["url"], wait_until="domcontentloaded", timeout=30000)
+        browser_download = None
+
+        def capture_download(download):
+            nonlocal browser_download
+            browser_download = download
+
+        page.on("download", capture_download)
+        navigation_error = None
+        try:
+            try:
+                page.goto(
+                    activity["url"], wait_until="domcontentloaded", timeout=30000
+                )
+            except PlaywrightError as error:
+                if "Download is starting" not in str(error):
+                    raise
+                navigation_error = error
+                # goto() raises before the "download" event is delivered, so keep
+                # the listener attached and wait (up to 30s) for the event.
+                for _ in range(300):
+                    if browser_download is not None:
+                        break
+                    page.wait_for_timeout(100)
+        finally:
+            page.remove_listener("download", capture_download)
+
+        if browser_download is not None:
+            destination = _download_destination(
+                browser_download.suggested_filename, activity["name"]
+            )
+            browser_download.save_as(str(destination))
+            if not destination.exists():
+                raise RuntimeError(
+                    f"Download finished but the file was not found at {destination}."
+                )
+            return destination
+        if navigation_error is not None:
+            raise RuntimeError(
+                "The LMS started a download but the browser never reported it."
+            ) from navigation_error
+
         file_links = page.locator(
             'a[href*="/pluginfile.php/"], a[href*="/draftfile.php/"], '
             'a[href*="forcedownload=1"], iframe[src*="/pluginfile.php/"], '
@@ -361,48 +487,345 @@ class _LmsBrowserWorker:
                 "on the LMS resource page."
             )
 
-        parsed_url = urlparse(direct_url)
+        return self._download_url(page, direct_url, activity["name"])
+
+    def _download_url(self, page, url: str, fallback_name: str) -> Path:
+        """Downloads a same-host LMS file to the Desktop using Chrome itself.
+
+        Playwright's APIRequestContext runs on Node's OpenSSL, which rejects the
+        LMS server's legacy TLS renegotiation (EPROTO ... unsafe legacy
+        renegotiation disabled). Chrome connects fine, so the file is fetched as
+        a normal browser download in a temporary tab that shares the login.
+        """
+        url = urljoin(page.url, url)
+        parsed_url = urlparse(url)
         if parsed_url.hostname != "lms.nust.edu.pk":
             raise RuntimeError("Refusing to download a file from an unexpected host.")
+        if (
+            "/pluginfile.php/" in parsed_url.path
+            or "/draftfile.php/" in parsed_url.path
+        ) and "forcedownload" not in parsed_url.query:
+            url += ("&" if parsed_url.query else "?") + "forcedownload=1"
 
-        response = page.context.request.get(direct_url, timeout=60000)
-        if not response.ok:
-            raise RuntimeError(
-                f"File download failed with HTTP {response.status}."
+        download_page = page.context.new_page()
+        captured = []
+        download_page.on("download", lambda download: captured.append(download))
+        try:
+            try:
+                download_page.goto(url, wait_until="commit", timeout=60000)
+            except PlaywrightError as error:
+                # Expected: navigating to a file attachment starts a download.
+                if "Download is starting" not in str(error):
+                    raise
+            # The download event can arrive just after goto() returns/raises.
+            for _ in range(600):
+                if captured:
+                    break
+                download_page.wait_for_timeout(100)
+            if not captured:
+                raise RuntimeError(
+                    f'The LMS did not start a download for "{fallback_name}".'
+                )
+
+            download = captured[0]
+            if urlparse(download.url).hostname != "lms.nust.edu.pk":
+                raise RuntimeError("The LMS file came from an unexpected host.")
+            destination = _download_destination(
+                download.suggested_filename, fallback_name
             )
-        if urlparse(response.url).hostname != "lms.nust.edu.pk":
-            raise RuntimeError("The LMS file redirected to an unexpected host.")
+            download.save_as(str(destination))
+        finally:
+            download_page.close()
 
-        headers = response.headers
-        disposition = headers.get("content-disposition", "")
-        encoded_filename = re.search(r"filename\*=UTF-8''([^;]+)", disposition, re.I)
-        plain_filename = re.search(
-            r'filename="?([^";]+)"?', disposition, re.I
-        )
-        if encoded_filename:
-            filename = unquote(encoded_filename.group(1))
-        elif plain_filename:
-            filename = plain_filename.group(1)
-        else:
-            filename = unquote(Path(parsed_url.path).name)
-
-        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(" .")
-        if not filename:
-            filename = re.sub(r"[^a-zA-Z0-9_-]+", "_", activity["name"]).strip("_")
-        if not Path(filename).suffix:
-            filename = f"{filename}.download"
-
-        download_dir = Path.home() / "Downloads" / "MyAgent LMS"
-        download_dir.mkdir(parents=True, exist_ok=True)
-        destination = download_dir / filename
-        suffix = destination.suffix
-        stem = destination.stem
-        counter = 1
-        while destination.exists():
-            destination = download_dir / f"{stem} ({counter}){suffix}"
-            counter += 1
-        destination.write_bytes(response.body())
+        if not destination.exists():
+            raise RuntimeError(
+                f"Download finished but the file was not found at {destination}."
+            )
         return destination
+
+    # ------------------------------------------------------------------
+    # Assignment submissions (download / delete / upload)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _assignment_url(activity: dict, action: str | None = None) -> str:
+        cmid = parse_qs(urlparse(activity["url"]).query).get("id", [""])[0]
+        if not cmid.isdigit():
+            raise RuntimeError(
+                f'Could not read the assignment id from {activity["url"]}.'
+            )
+        url = f"https://lms.nust.edu.pk/mod/assign/view.php?id={cmid}"
+        if action:
+            url += f"&action={action}"
+        return url
+
+    def _open_assignment(self, page, activity: dict):
+        page.goto(
+            self._assignment_url(activity),
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        if page.locator("#login input#password").count():
+            raise RuntimeError(
+                "The LMS session has expired. Log in again before continuing."
+            )
+        try:
+            page.locator(".submissionstatustable").first.wait_for(
+                state="visible", timeout=15000
+            )
+        except PlaywrightTimeoutError as error:
+            raise RuntimeError(
+                f'Could not find the submission status on the page for '
+                f'"{activity["name"]}".'
+            ) from error
+
+    @staticmethod
+    def _submitted_file_links(page) -> list[dict]:
+        return page.locator(
+            '.fileuploadsubmission a[href*="/assignsubmission_file/"]'
+        ).evaluate_all(
+            "links => links.map(a => ({name: a.innerText.trim(), url: a.href}))"
+        )
+
+    def _download_submission_files(self, page, activity: dict) -> list[Path]:
+        self._open_assignment(page, activity)
+        paths = []
+        seen_urls = set()
+        for link in self._submitted_file_links(page):
+            if link["url"] in seen_urls:
+                continue
+            seen_urls.add(link["url"])
+            paths.append(
+                self._download_url(page, link["url"], link["name"] or activity["name"])
+            )
+        return paths
+
+    def _get_submission_details(self, page, activity: dict) -> str:
+        """Read-only: summarises everything the assignment page shows."""
+        self._open_assignment(page, activity)
+        data = page.evaluate(
+            r"""() => {
+                const clean = text => (text || '').replace(/\s+/g, ' ').trim();
+                const tableRows = table => Array.from(table.querySelectorAll('tr'))
+                    .flatMap(row => {
+                        const label = row.querySelector('th');
+                        const value = row.querySelector('td');
+                        return label && value
+                            ? [[clean(label.innerText), clean(value.innerText)]]
+                            : [];
+                    });
+                const summary = document.querySelector('.submissionsummarytable table');
+                const feedbackTables = Array.from(new Set(Array.from(
+                    document.querySelectorAll('.feedbacktable table, .feedback table')
+                )));
+                return {
+                    title: clean(document.querySelector('.activity-name')?.innerText),
+                    description: clean(
+                        document.querySelector('.activity-description')?.innerText
+                    ),
+                    dates: Array.from(document.querySelectorAll(
+                        '[data-region="activity-dates"] > div'
+                    )).map(element => clean(element.innerText)),
+                    rows: summary ? tableRows(summary) : [],
+                    files: Array.from(document.querySelectorAll(
+                        '.fileuploadsubmission a[href]'
+                    )).map(link => ({
+                        name: clean(link.innerText),
+                        url: link.href,
+                        time: clean(
+                            link.closest('.fileuploadsubmission')?.parentElement
+                                ?.querySelector('.fileuploadsubmissiontime')?.innerText
+                        ),
+                    })),
+                    commentCount: clean(
+                        document.querySelector('.comment-link-count')?.innerText
+                    ),
+                    feedback: feedbackTables.flatMap(tableRows),
+                    actions: Array.from(document.querySelectorAll(
+                        '.singlebutton button'
+                    )).map(button => clean(button.innerText)).filter(Boolean),
+                };
+            }"""
+        )
+
+        lines = [f'Assignment: {data["title"] or activity["name"]}']
+        lines.extend(data["dates"])
+        if data["description"]:
+            lines.append(f'Description: {data["description"]}')
+        lines.append("Submission status:")
+        for label, value in data["rows"]:
+            if label in {"File submissions", "Submission comments"}:
+                continue
+            lines.append(f"  {label}: {value}")
+        files = data["files"]
+        if files:
+            lines.append(f"Submitted files ({len(files)}):")
+            for file in files:
+                when = f' (submitted {file["time"]})' if file["time"] else ""
+                lines.append(f'  - {file["name"]}{when} -> {file["url"]}')
+        else:
+            lines.append("Submitted files: none")
+        lines.append(f'Submission comments: {data["commentCount"] or "0"}')
+        if data["feedback"]:
+            lines.append("Feedback / grading:")
+            for label, value in data["feedback"]:
+                lines.append(f"  {label}: {value}")
+        if data["actions"]:
+            lines.append("Available actions: " + ", ".join(data["actions"]))
+        lines.append(f"Page: {self._assignment_url(activity)}")
+        return "\n".join(lines)
+
+    def _delete_submission(self, page, activity: dict) -> str:
+        self._open_assignment(page, activity)
+        files = self._submitted_file_links(page)
+        has_remove_button = page.locator(
+            'form input[name="action"][value="removesubmissionconfirm"]'
+        ).count()
+        if not has_remove_button:
+            if not files:
+                return f'There is no submission on "{activity["name"]}" to delete.'
+            return (
+                f'The "Remove submission" option is not available for '
+                f'"{activity["name"]}" (it may be locked or already graded).'
+            )
+
+        page.goto(
+            self._assignment_url(activity, "removesubmissionconfirm"),
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        continue_button = page.get_by_role(
+            "button", name=re.compile(r"^\s*continue\s*$", re.I)
+        ).first
+        try:
+            continue_button.wait_for(state="visible", timeout=15000)
+        except PlaywrightTimeoutError as error:
+            raise RuntimeError(
+                "The LMS did not show the remove-submission confirmation page."
+            ) from error
+        with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
+            continue_button.click(timeout=10000)
+
+        self._open_assignment(page, activity)
+        if self._submitted_file_links(page):
+            raise RuntimeError(
+                "Confirmed the removal but the submitted file is still listed."
+            )
+        names = ", ".join(link["name"] for link in files) or "the submission"
+        return f'Deleted {names} from "{activity["name"]}".'
+
+    def _upload_submission(self, page, activity: dict, options: dict) -> str:
+        file_path = Path(options["file_path"])
+        replace_existing = bool(options.get("replace_existing"))
+
+        self._open_assignment(page, activity)
+        existing = self._submitted_file_links(page)
+        removed_note = ""
+        if existing:
+            names = ", ".join(link["name"] for link in existing)
+            if not replace_existing:
+                return (
+                    f'"{activity["name"]}" already has a submission ({names}). '
+                    "Nothing was uploaded. Ask the user whether to replace it, "
+                    "then retry with replace_existing=True."
+                )
+            self._delete_submission(page, activity)
+            removed_note = f"Removed the previous submission ({names}). "
+
+        page.goto(
+            self._assignment_url(activity, "editsubmission"),
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        if page.locator("#login input#password").count():
+            raise RuntimeError(
+                "The LMS session has expired. Log in again before continuing."
+            )
+        add_button = page.locator(".filemanager .fp-btn-add a").first
+        try:
+            add_button.wait_for(state="visible", timeout=15000)
+        except PlaywrightTimeoutError as error:
+            alert = page.locator(".alert").first
+            reason = (
+                f" LMS says: {alert.inner_text().strip()}"
+                if alert.count() and alert.is_visible()
+                else ""
+            )
+            raise RuntimeError(
+                f'Could not open the upload form for "{activity["name"]}" '
+                f"(submissions may be closed or locked).{reason}"
+            ) from error
+
+        files_before = page.evaluate(
+            """() => Array.from(document.querySelectorAll(
+                '.filemanager .fp-content .fp-file'
+            )).filter(element => element.offsetParent !== null).length"""
+        )
+        add_button.click(timeout=10000)
+        upload_repo = (
+            page.locator(".fp-repo-area .fp-repo")
+            .filter(has_text=re.compile(r"upload a file", re.I))
+            .first
+        )
+        upload_repo.wait_for(state="visible", timeout=15000)
+        upload_repo.click(timeout=10000)
+
+        file_input = page.locator('.fp-upload-form input[type="file"]').first
+        file_input.wait_for(state="attached", timeout=15000)
+        file_input.set_input_files(str(file_path))
+        page.locator(".fp-upload-form .fp-upload-btn").first.click(timeout=10000)
+
+        outcome = page.wait_for_function(
+            """(before) => {
+                const visible = element => element.offsetParent !== null;
+                const error = Array.from(document.querySelectorAll(
+                    '.fp-msg-error, .moodle-dialogue-exception .moodle-exception-message'
+                )).find(visible);
+                if (error) {
+                    const text = error.querySelector('.fp-msg-text') || error;
+                    return 'error:' + text.innerText.trim();
+                }
+                const files = Array.from(document.querySelectorAll(
+                    '.filemanager .fp-content .fp-file'
+                )).filter(visible);
+                return files.length > before ? 'ok' : false;
+            }""",
+            arg=files_before,
+            timeout=240000,
+        ).json_value()
+        if str(outcome).startswith("error:"):
+            raise RuntimeError(f"LMS rejected the upload: {outcome[6:]}")
+
+        # The LMS requires the academic-honesty statement to be ticked before
+        # the submission can be saved.
+        statement = page.locator("#id_submissionstatement")
+        if statement.count():
+            if not statement.is_checked():
+                statement.check(timeout=10000)
+            if not statement.is_checked():
+                raise RuntimeError(
+                    "Could not tick the 'This submission is my own work' statement."
+                )
+
+        with page.expect_navigation(wait_until="domcontentloaded", timeout=60000):
+            page.locator("#id_submitbutton").click(timeout=10000)
+
+        self._open_assignment(page, activity)
+        saved = self._submitted_file_links(page)
+        if not saved:
+            raise RuntimeError(
+                "The form was saved but no submitted file is listed on the "
+                "assignment page. Please check it manually."
+            )
+        message = (
+            f'{removed_note}Uploaded "{file_path.name}" to "{activity["name"]}". '
+            f'Files now submitted: {", ".join(link["name"] for link in saved)}.'
+        )
+        if page.locator('form input[name="action"][value="submit"]').count():
+            message += (
+                " It is saved as a draft: this assignment still has a "
+                '"Submit assignment" button that must be pressed to finalise it.'
+            )
+        return message
 
 
 def _get_lms_browser_worker() -> _LmsBrowserWorker:
@@ -497,6 +920,95 @@ def download_course_material(course_name: str, material_name: str) -> str:
     material_query = _validate_lms_item_query(material_name, "Material")
     return _get_lms_browser_worker().open_activity(
         "download_material", course_query, material_query
+    )
+
+
+@tool
+def download_course_submission(course_name: str, submission_name: str) -> str:
+    """Downloads the file(s) the user has ALREADY submitted to an LMS assignment/submission page onto their Desktop.
+    Args:
+        course_name: Course name, course code, or abbreviation.
+        submission_name: Assignment/submission title, e.g. 'LAB 5 SUBMISSION-B'.
+    """
+    course_query = _validate_lms_item_query(course_name, "Course")
+    submission_query = _validate_lms_item_query(submission_name, "Submission")
+    return _get_lms_browser_worker().open_activity(
+        "download_submission", course_query, submission_query
+    )
+
+
+@tool
+def get_course_submission_details(course_name: str, submission_name: str) -> str:
+    """Reports the full details of the user's submission on an LMS assignment page (read-only).
+    Covers opened/due dates, submission and grading status, time remaining, last modified,
+    submitted file names with upload times, comment count, any grade/feedback, and which
+    actions (edit/remove/submit) are available. Nothing is downloaded or changed.
+    Args:
+        course_name: Course name, course code, or abbreviation.
+        submission_name: Assignment/submission title, e.g. 'LAB 7 SUBMISSION-B'.
+    """
+    course_query = _validate_lms_item_query(course_name, "Course")
+    submission_query = _validate_lms_item_query(submission_name, "Submission")
+    return _get_lms_browser_worker().open_activity(
+        "submission_details", course_query, submission_query
+    )
+
+
+@tool
+def delete_course_submission(
+    course_name: str, submission_name: str, confirm: bool = False
+) -> str:
+    """Deletes (removes) the user's existing submission on an LMS assignment. This cannot be undone.
+    Only set confirm=True after the user has explicitly asked to delete that submission.
+    Args:
+        course_name: Course name, course code, or abbreviation.
+        submission_name: Assignment/submission title, e.g. 'LAB 5 SUBMISSION-B'.
+        confirm: Must be True to actually delete; otherwise nothing is changed.
+    """
+    course_query = _validate_lms_item_query(course_name, "Course")
+    submission_query = _validate_lms_item_query(submission_name, "Submission")
+    if not confirm:
+        return (
+            f'Nothing was deleted. Deleting the submission on "{submission_query}" '
+            "cannot be undone; ask the user to confirm, then call this tool again "
+            "with confirm=True."
+        )
+    return _get_lms_browser_worker().open_activity(
+        "delete_submission", course_query, submission_query
+    )
+
+
+@tool
+def upload_course_submission(
+    course_name: str,
+    submission_name: str,
+    file_path: str,
+    replace_existing: bool = False,
+) -> str:
+    """Uploads a local file from the given path as the user's submission on an LMS assignment and saves it.
+    If a submission already exists, nothing is uploaded unless replace_existing=True
+    (which first deletes the old submission, so ask the user before using it).
+    Args:
+        course_name: Course name, course code, or abbreviation.
+        submission_name: Assignment/submission title, e.g. 'LAB 5 SUBMISSION-B'.
+        file_path: Full path of the file on this computer, e.g. 'E:\\Labs\\lab5.zip'.
+        replace_existing: Replace an existing submission with this file.
+    """
+    course_query = _validate_lms_item_query(course_name, "Course")
+    submission_query = _validate_lms_item_query(submission_name, "Submission")
+    cleaned_path = file_path.strip().strip('"').strip("'")
+    if not cleaned_path:
+        raise ValueError("File path cannot be empty.")
+    path = Path(cleaned_path).expanduser()
+    if not path.is_file():
+        raise ValueError(f"File not found: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError(f"File is empty: {path}")
+    return _get_lms_browser_worker().open_activity(
+        "upload_submission",
+        course_query,
+        submission_query,
+        {"file_path": str(path.resolve()), "replace_existing": replace_existing},
     )
 
 
