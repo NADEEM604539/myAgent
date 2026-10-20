@@ -2,13 +2,16 @@ import datetime
 import platform
 
 from langchain_core.tools import tool
-from backend.google_search_tools import google_search
 from backend.lms_tools import (
     course_selector,
+    delete_course_submission,
     download_course_material,
+    download_course_submission,
+    get_course_submission_details,
     login_to_lms,
     open_course_quiz,
     open_course_submission,
+    upload_course_submission,
 )
 
 
@@ -44,5 +47,8 @@ ALL_TOOLS = [
     open_course_quiz,
     open_course_submission,
     download_course_material,
-    google_search,
+    download_course_submission,
+    get_course_submission_details,
+    delete_course_submission,
+    upload_course_submission,
 ]
